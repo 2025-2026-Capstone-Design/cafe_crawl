@@ -1,6 +1,11 @@
 """
 processors.py
-텍스트 전처리, 샘플링, 번역, 분류, 감성분석 등 핵심 로직
+6단계 파이프라인 기반 텍스트 분류 시스템
+Step 1-2: KiwiAnalyzer (품사 보존형 형태소 분석)
+Step 3: SBERTMapper (앵커 기반 유사도)
+Step 4: ConfidenceMonitor (경계 샘플 필터링)
+Step 5: LLM_Refiner (Groq 기반 정제)
+Step 6: FinalClassifier (최종 통합)
 """
 
 import re
@@ -18,7 +23,7 @@ from sklearn.metrics.pairwise import cosine_similarity
 from bertopic.representation._base import BaseRepresentation
 import spacy
 
-# Kiwi 전역 초기화
+# 전역 초기화
 kiwi = Kiwi()
 nlp = spacy.load("en_core_web_sm", disable=["parser", "ner"])
 
@@ -330,48 +335,343 @@ def translate_keywords_to_korean(aspect_keywords_en, essential_kr, cache_file='k
 
 
 # ============================================================
-# 7. 어간 추출
+# STEP 1-2: KiwiAnalyzer (품사 보존형 형태소 분석)
 # ============================================================
 
-def extract_korean_stems(korean_keywords):
-    """한글 키워드에서 어간 추출"""
-    print("\n✂️ 한글 어간 추출 중...")
+class KiwiAnalyzer:
+    """품사 태그 보존형 형태소 분석기"""
 
-    stems_dict = {}
-    for aspect, kws in korean_keywords.items():
-        stems = set()
-        for kw in kws:
-            tokens = kiwi.tokenize(kw)
-            for t in tokens:
-                if t.tag in ['VA', 'VV', 'XR', 'NNG', 'NNP']:
-                    stems.add(t.form)
-        stems_dict[aspect] = list(stems)
-        print(f"  [{aspect}]: {len(stems)}개 어간")
+    def __init__(self):
+        self.kiwi = Kiwi()
+        self.target_pos = ['VA', 'VV', 'NNG', 'NNP', 'MAG', 'XR']
 
-    return stems_dict
+    def analyze_with_pos(self, text):
+        """품사 태그를 포함한 토큰 반환"""
+        tokens = self.kiwi.tokenize(text)
+        return [(t.form, t.tag) for t in tokens if t.tag in self.target_pos]
+
+    def get_morphs_for_matching(self, text):
+        """매칭용 정규화된 형태소 딕셔너리 (품사별 가중치 적용 가능)"""
+        analyzed = self.analyze_with_pos(text)
+        return {form: tag for form, tag in analyzed}
+
+    def extract_stems_dict(self, keyword_dict):
+        """키워드 사전에서 어간 추출"""
+        print("\n✂️ 한글 어간 추출 중...")
+        stems_dict = {}
+
+        for aspect, keywords in keyword_dict.items():
+            stems = set()
+            for kw in keywords:
+                tokens = self.kiwi.tokenize(kw)
+                for t in tokens:
+                    if t.tag in self.target_pos:
+                        stems.add(t.form)
+
+            stems_dict[aspect] = list(stems)
+            print(f"  [{aspect}]: {len(stems)}개 어간")
+
+        return stems_dict
 
 
 # ============================================================
-# 8. 키워드 기반 분류
+# STEP 3: SBERTMapper (앵커 기반 유사도 계산)
 # ============================================================
 
-def classify_with_korean_keywords(df, aspect_keywords_kr):
-    """한글 키워드 기반 분류 (다중 라벨)"""
+class SBERTMapper:
+    """앵커 문장 기반 유사도 매핑"""
+
+    def __init__(self, model_name='paraphrase-multilingual-MiniLM-L12-v2'):
+        self.model = SentenceTransformer(model_name)
+        self.anchor_embeddings = {}
+        self.aspect_names = []
+
+    def set_anchors(self, aspect_keywords_en):
+        """각 측면별 앵커 문장 임베딩 생성"""
+        print("\n🎯 앵커 임베딩 생성 중...")
+
+        self.aspect_names = list(aspect_keywords_en.keys())
+
+        for aspect, keywords in aspect_keywords_en.items():
+            # 키워드를 자연스러운 문장으로 변환
+            kw_sample = keywords[:5] if len(keywords) >= 5 else keywords
+            anchor_text = f"This cafe has good {', '.join(kw_sample)}"
+            self.anchor_embeddings[aspect] = self.model.encode(anchor_text)
+            print(f"  ✓ {aspect}: {anchor_text[:50]}...")
+
+    def compute_similarities(self, texts):
+        """모든 텍스트에 대해 앵커별 유사도 계산"""
+        print(f"\n🔍 유사도 계산 중: {len(texts)}건...")
+
+        text_embs = self.model.encode(texts, show_progress_bar=True)
+
+        results = []
+        for text, emb in zip(texts, text_embs):
+            scores = {}
+            for aspect, anchor_emb in self.anchor_embeddings.items():
+                scores[aspect] = float(cosine_similarity([emb], [anchor_emb])[0][0])
+            results.append(scores)
+
+        return results  # [{aspect: score, ...}, ...]
+
+
+# ============================================================
+# STEP 4: ConfidenceMonitor (경계 샘플 필터링)
+# ============================================================
+
+class ConfidenceMonitor:
+    """신뢰도 기반 경계 샘플 탐지"""
+
+    def __init__(self, high_threshold=0.6, low_threshold=0.35, margin_threshold=0.15):
+        self.high_threshold = high_threshold
+        self.low_threshold = low_threshold
+        self.margin_threshold = margin_threshold
+
+    def classify_by_confidence(self, similarity_scores):
+        """
+        유사도 점수를 기반으로 샘플 분류
+
+        Returns:
+            confident: 확신 있는 샘플 (바로 라벨링)
+            boundary: 경계 샘플 (LLM 검증 필요)
+            uncertain: 불확실 샘플 (제외)
+        """
+        confident = []
+        boundary = []
+        uncertain = []
+
+        for idx, scores in enumerate(similarity_scores):
+            if not scores:
+                uncertain.append(idx)
+                continue
+
+            max_score = max(scores.values())
+            max_aspect = max(scores, key=scores.get)
+
+            # 2등과의 차이 계산
+            sorted_scores = sorted(scores.values(), reverse=True)
+            margin = sorted_scores[0] - sorted_scores[1] if len(sorted_scores) > 1 else 1.0
+
+            if max_score >= self.high_threshold and margin > self.margin_threshold:
+                # 확신 있는 샘플
+                confident.append({
+                    'index': idx,
+                    'aspect': [max_aspect],
+                    'confidence': max_score,
+                    'method': 'sbert_high_conf'
+                })
+            elif max_score >= self.low_threshold:
+                # 경계 영역 - LLM 검증 필요
+                candidates = [asp for asp, sc in scores.items()
+                             if sc >= self.low_threshold]
+                boundary.append({
+                    'index': idx,
+                    'candidates': candidates,
+                    'scores': scores,
+                    'max_score': max_score,
+                    'margin': margin
+                })
+            else:
+                # 불확실 샘플
+                uncertain.append(idx)
+
+        print(f"\n📊 신뢰도 필터링 결과:")
+        print(f"  ✅ 확신: {len(confident)}건 (바로 라벨링)")
+        print(f"  🤔 경계: {len(boundary)}건 (LLM 검증 필요)")
+        print(f"  ❌ 불확실: {len(uncertain)}건 (제외)")
+
+        return confident, boundary, uncertain
+
+
+# ============================================================
+# STEP 5: LLM_Refiner (Groq 기반 경계 샘플 정제)
+# ============================================================
+
+class LLM_Refiner:
+    """Groq를 이용한 경계 샘플 정제 및 키워드 학습"""
+
+    def __init__(self, groq_api_key, model="llama-3.3-70b-versatile"):
+        self.api_key = groq_api_key
+        self.model = model
+        self.headers = {
+            "Authorization": f"Bearer {groq_api_key}",
+            "Content-Type": "application/json"
+        }
+        self.discovered_keywords = {}  # 새로 발견된 키워드 저장
+        self.refinement_stats = {'success': 0, 'failed': 0, 'skipped': 0}
+
+    def refine_boundary_samples(self, df, boundary_samples, aspect_keywords_en, max_samples=None):
+        """경계 샘플의 진짜 라벨 결정 및 키워드 학습"""
+        print(f"\n🔬 LLM 정제 시작: {len(boundary_samples)}건...")
+
+        refined_labels = []
+        samples_to_process = boundary_samples[:max_samples] if max_samples else boundary_samples
+
+        for i, sample in enumerate(samples_to_process):
+            idx = sample['index']
+            text = df.iloc[idx]['text']
+            candidates = sample['candidates']
+            scores = sample['scores']
+
+            if (i + 1) % 10 == 0:
+                print(f"  진행: {i+1}/{len(samples_to_process)}")
+
+            # Groq에게 물어보기
+            chosen_aspect, new_keywords, confidence = self._ask_llm(
+                text, candidates, scores, aspect_keywords_en
+            )
+
+            if chosen_aspect:
+                refined_labels.append({
+                    'index': idx,
+                    'aspect': [chosen_aspect],
+                    'method': 'llm_refined',
+                    'confidence': confidence,
+                    'new_keywords': new_keywords
+                })
+
+                # 새 키워드 수집
+                if new_keywords:
+                    if chosen_aspect not in self.discovered_keywords:
+                        self.discovered_keywords[chosen_aspect] = set()
+                    self.discovered_keywords[chosen_aspect].update(new_keywords)
+
+                self.refinement_stats['success'] += 1
+            else:
+                self.refinement_stats['failed'] += 1
+
+            time.sleep(0.5)  # Rate limit
+
+        print(f"\n✅ LLM 정제 완료:")
+        print(f"  성공: {self.refinement_stats['success']}건")
+        print(f"  실패: {self.refinement_stats['failed']}건")
+
+        return refined_labels
+
+    def _ask_llm(self, text, candidates, scores, aspect_keywords_en):
+        """Groq API로 진짜 측면 판단"""
+
+        # 후보 측면 설명 생성
+        candidate_desc = []
+        for asp in candidates:
+            kws = aspect_keywords_en.get(asp, [])[:5]
+            score = scores.get(asp, 0)
+            candidate_desc.append(f"- {asp} (score: {score:.2f}): {', '.join(kws)}")
+
+        prompt = f"""You are analyzing a Korean cafe review.
+
+Review: "{text}"
+
+Candidate aspects (with similarity scores):
+{chr(10).join(candidate_desc)}
+
+Task:
+1. Choose the MOST relevant aspect from the candidates above
+2. Suggest 2-3 new English keywords that represent this aspect in the review
+3. Rate your confidence (0.0-1.0)
+
+Output ONLY valid JSON:
+{{
+  "aspect": "chosen_aspect_name",
+  "new_keywords": ["keyword1", "keyword2"],
+  "confidence": 0.85
+}}"""
+
+        payload = {
+            "model": self.model,
+            "messages": [{"role": "user", "content": prompt}],
+            "max_tokens": 200,
+            "temperature": 0.2,
+            "response_format": {"type": "json_object"}
+        }
+
+        try:
+            response = requests.post(
+                "https://api.groq.com/openai/v1/chat/completions",
+                headers=self.headers,
+                json=payload,
+                timeout=20
+            )
+
+            if response.status_code != 200:
+                return None, [], 0.0
+
+            result = response.json()
+            content = json.loads(result['choices'][0]['message']['content'])
+
+            aspect = content.get('aspect')
+            keywords = content.get('new_keywords', [])
+            confidence = content.get('confidence', 0.5)
+
+            # 유효성 검사
+            if aspect not in candidates:
+                return None, [], 0.0
+
+            # 키워드 정제
+            clean_keywords = [kw.strip().lower() for kw in keywords
+                             if isinstance(kw, str) and len(kw) > 2 and kw.isalpha()]
+
+            return aspect, clean_keywords, confidence
+
+        except Exception as e:
+            print(f"\n⚠️ LLM 오류: {e}")
+            return None, [], 0.0
+
+    def export_discovered_keywords(self, filename='discovered_keywords.json'):
+        """발견된 키워드를 파일로 저장"""
+        export_dict = {k: list(v) for k, v in self.discovered_keywords.items()}
+
+        with open(filename, 'w', encoding='utf-8') as f:
+            json.dump(export_dict, f, indent=2, ensure_ascii=False)
+
+        print(f"\n💾 발견된 키워드 저장: {filename}")
+
+        for aspect, keywords in export_dict.items():
+            if keywords:
+                print(f"  {aspect}: {keywords[:5]}")
+
+    def get_enhanced_keywords(self, original_keywords_en):
+        """원본 키워드에 발견된 키워드 병합"""
+        enhanced = {}
+        for aspect, orig_kws in original_keywords_en.items():
+            enhanced[aspect] = list(set(orig_kws))
+            if aspect in self.discovered_keywords:
+                enhanced[aspect].extend(list(self.discovered_keywords[aspect]))
+                enhanced[aspect] = list(set(enhanced[aspect]))
+
+        return enhanced
+
+
+# ============================================================
+# 기존 키워드 기반 분류 (개선)
+# ============================================================
+
+def classify_with_korean_keywords(df, aspect_keywords_kr, analyzer=None):
+    """한글 키워드 기반 분류 (형태소 분석 활용)"""
     print("\n🔍 키워드 기반 분류 시작...")
+
+    if analyzer is None:
+        analyzer = KiwiAnalyzer()
 
     df['aspect'] = None
     df['classification_method'] = None
 
-    aspect_sets = {aspect: set(keywords) for aspect, keywords in aspect_keywords_kr.items()}
+    # 키워드를 형태소로 변환
+    aspect_morphs = {}
+    for aspect, keywords in aspect_keywords_kr.items():
+        morphs = set()
+        for kw in keywords:
+            morph_dict = analyzer.get_morphs_for_matching(kw)
+            morphs.update(morph_dict.keys())
+        aspect_morphs[aspect] = morphs
 
     for idx, row in df.iterrows():
         text = row['text']
-        tokens = [t.form for t in kiwi.tokenize(text)]
-        token_set = set(tokens)
+        text_morphs = set(analyzer.get_morphs_for_matching(text).keys())
 
         found_aspects = []
-        for aspect, k_set in aspect_sets.items():
-            if not token_set.isdisjoint(k_set):
+        for aspect, k_morphs in aspect_morphs.items():
+            if not text_morphs.isdisjoint(k_morphs):
                 found_aspects.append(aspect)
 
         if found_aspects:
@@ -388,248 +688,60 @@ def classify_with_korean_keywords(df, aspect_keywords_kr):
 
 
 # ============================================================
-# 9. SBERT 의미 기반 분류
+# STEP 6: FinalClassifier (최종 통합)
 # ============================================================
 
-def classify_with_multilingual_sbert(df_unlabeled, aspect_keywords_en, threshold=0.45):
-    """다국어 SBERT로 의미 기반 분류 (다중 라벨)"""
-    if df_unlabeled.empty:
-        return pd.DataFrame(), df_unlabeled
+def classify_with_pipeline(df, aspect_keywords_en, aspect_keywords_kr, groq_api_key):
+    """6단계 파이프라인 실행"""
 
-    print(f"\n🧐 SBERT 의미 분석: {len(df_unlabeled)}건...")
+    print("\n" + "=" * 60)
+    print("🚀 6단계 분류 파이프라인 시작")
+    print("=" * 60)
 
-    model = SentenceTransformer('paraphrase-multilingual-MiniLM-L12-v2')
+    # Step 1-2: 형태소 분석
+    analyzer = KiwiAnalyzer()
+    df['morphs'] = df['text'].apply(analyzer.get_morphs_for_matching)
 
-    aspect_names = list(aspect_keywords_en.keys())
-    aspect_descriptions = [" ".join(aspect_keywords_en[asp]) for asp in aspect_names]
-    aspect_embs = model.encode(aspect_descriptions, convert_to_tensor=True)
+    # 키워드 매칭 (기존 방식)
+    labeled_kw, unlabeled = classify_with_korean_keywords(df, aspect_keywords_kr)
+    print(f"\n📍 Step 1-2 완료: {len(labeled_kw)}건 키워드 매칭")
 
-    sentences = df_unlabeled['text'].tolist()
-    sentence_embs = model.encode(sentences, convert_to_tensor=True, show_progress_bar=True)
+    # Step 3: SBERT 유사도 계산
+    mapper = SBERTMapper()
+    mapper.set_anchors(aspect_keywords_en)
+    similarity_scores = mapper.compute_similarities(unlabeled['text'].tolist())
+    print(f"\n📍 Step 3 완료: 유사도 계산")
 
-    cos_scores = util.cos_sim(sentence_embs, aspect_embs)
+    # Step 4: 신뢰도 기반 필터링
+    monitor = ConfidenceMonitor()
+    confident, boundary, uncertain = monitor.classify_by_confidence(similarity_scores)
+    print(f"\n📍 Step 4 완료: 경계 샘플 {len(boundary)}건 탐지")
 
-    sbert_results = []
-    for i in range(len(sentences)):
-        matched_indices = (cos_scores[i] >= threshold).nonzero(as_tuple=True)[0]
+    # Step 5: LLM으로 경계 샘플 정제
+    refiner = LLM_Refiner(groq_api_key)
+    refined = refiner.refine_boundary_samples(unlabeled, boundary, aspect_keywords_en)
+    refiner.export_discovered_keywords()
+    print(f"\n📍 Step 5 완료: {len(refined)}건 정제")
 
-        if len(matched_indices) > 0:
-            found_aspects = [aspect_names[idx] for idx in matched_indices]
-            row_data = df_unlabeled.iloc[i].to_dict()
-            row_data['aspect'] = found_aspects
-            row_data['classification_method'] = 'sbert_semantic'
-            sbert_results.append(row_data)
+    # Step 6: 최종 통합
+    final_df = pd.concat([
+        labeled_kw,
+        _build_df_from_results(unlabeled, confident),
+        _build_df_from_results(unlabeled, refined)
+    ], ignore_index=True)
 
-    df_sbert_labeled = pd.DataFrame(sbert_results)
+    print(f"\n✅ 최종 분류 완료: {len(final_df)}건 / {len(df)}건")
+    print("=" * 60)
 
-    if not df_sbert_labeled.empty:
-        labeled_texts = set(df_sbert_labeled['text'])
-        df_still_unlabeled = df_unlabeled[~df_unlabeled['text'].isin(labeled_texts)].copy()
-    else:
-        df_still_unlabeled = df_unlabeled.copy()
-
-    print(f"✅ SBERT 추가 라벨링: {len(df_sbert_labeled)}건")
-    return df_sbert_labeled, df_still_unlabeled
-
-
-# ============================================================
-# 10. BERTopic + Groq 신규 측면 발견
-# ============================================================
-
-class GroqRepresentation(BaseRepresentation):
-    """Groq API를 사용하는 BERTopic 커스텀 표현 모델"""
-
-    def __init__(self, api_key, model="llama-3.3-70b-versatile", delay=0.5):
-        self.api_key = api_key
-        self.model = model
-        self.delay = delay
-        self.headers = {
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json"
-        }
-
-    def extract_topics(self, topic_model, documents, c_tf_idf, topics):
-        """BERTopic이 호출하는 메서드 - 각 토픽의 대표 단어 생성"""
-        updated_topics = {}
-
-        # documents를 안전하게 리스트로 변환
-        if isinstance(documents, pd.DataFrame):
-            docs_list = documents.iloc[:, 0].tolist()
-        elif hasattr(documents, 'values'):
-            docs_list = documents.values.flatten().tolist()
-        elif isinstance(documents, list):
-            docs_list = documents
-        else:
-            docs_list = list(documents)
-
-        print(f"\n📊 총 {len(set(topics)) - (1 if -1 in topics else 0)}개 토픽 발견")
-
-        for topic_id in sorted(set(topics)):
-            if topic_id == -1:
-                continue
-
-            topic_docs = [docs_list[i] for i, t in enumerate(topics) if t == topic_id]
-            print(f"🔍 토픽 {topic_id}: {len(topic_docs)}개 문서 분석 중...", end=" ")
-
-            if len(topic_docs) > 10:
-                import random
-                topic_docs = random.sample(topic_docs, 10)
-
-            representative_word = self._get_representative_word(topic_docs)
-
-            if representative_word:
-                updated_topics[topic_id] = [(representative_word, 1.0)]
-                print(f"✅ '{representative_word}'")
-            else:
-                print("❌ 실패")
-
-            time.sleep(self.delay)
-
-        return updated_topics
-
-    def _get_representative_word(self, documents):
-        """문서 리스트를 받아 하나의 대표 단어를 생성"""
-        context = "\n".join(documents[:5])[:1000]
-
-        prompt = f"""You are analyzing cafe reviews. Here are sample reviews from a cluster:
-
-{context}
-
-Task: Provide ONE single English word that best represents the common aspect/theme in these reviews.
-
-Examples of good outputs:
-- Toilet
-- Parking
-- Pet
-- Waiting
-- Music
-- Wifi
-- Seating
-
-Output ONLY the word, nothing else:"""
-
-        payload = {
-            "model": self.model,
-            "messages": [{"role": "user", "content": prompt}],
-            "max_tokens": 10,
-            "temperature": 0.3
-        }
-
-        try:
-            response = requests.post(
-                "https://api.groq.com/openai/v1/chat/completions",
-                headers=self.headers,
-                json=payload,
-                timeout=15
-            )
-
-            result = response.json()
-            word = result['choices'][0]['message']['content'].strip()
-            word = word.split()[0].strip('.,!?"\'').capitalize()
-
-            if word.isalpha() and len(word) >= 2:
-                return word
-
-        except Exception as e:
-            print(f"\n⚠️  Groq API 오류: {e}")
-
-        return None
+    return final_df
 
 
-def discover_new_aspects_with_bertopic(df_sample, groq_api_key, top_n=5, min_cluster_size=30):
-    """
-    BERTopic + Groq를 사용하여 새로운 측면 발견
-
-    Args:
-        df_sample: 번역된 영문 샘플 데이터프레임
-        groq_api_key: Groq API 키
-        top_n: 반환할 최대 측면 개수
-        min_cluster_size: 최소 클러스터 크기
-    """
-    print("\n[데이터 탐사] BERTopic + Groq로 새로운 카테고리 후보 찾는 중...")
-
-    try:
-        from bertopic import BERTopic
-    except ImportError:
-        print("⚠️  bertopic 패키지가 설치되지 않았습니다. pip install bertopic")
-        return []
-
-    docs = df_sample['text_en'].dropna().tolist()
-    print(f"분석 대상 문서: {len(docs)}건")
-
-    # 임베딩 모델
-    embedding_model = SentenceTransformer('all-MiniLM-L6-v2')
-
-    # Groq 표현 모델
-    groq_repr = GroqRepresentation(api_key=groq_api_key)
-
-    # BERTopic 모델
-    topic_model = BERTopic(
-        embedding_model=embedding_model,
-        representation_model=groq_repr,
-        min_topic_size=min_cluster_size,
-        nr_topics="auto",
-        verbose=True,
-        calculate_probabilities=False
-    )
-
-    # 토픽 모델링 실행
-    print("\n🔄 클러스터링 및 토픽 추출 중...")
-    topics, _ = topic_model.fit_transform(docs)
-
-    # 토픽 정보 추출
-    topic_info = topic_model.get_topic_info()
-    valid_topics = topic_info[topic_info['Topic'] != -1].copy()
-
-    print(f"\n발견된 토픽 수: {len(valid_topics)}개")
-    print("\n토픽별 문서 수:")
-    print(valid_topics[['Topic', 'Count', 'Name']].head(10))
-
-    # 대표 단어 추출
-    candidates = []
-
-    for idx, row in valid_topics.head(top_n * 2).iterrows():
-        topic_id = row['Topic']
-        topic_words = topic_model.get_topic(topic_id)
-
-        if topic_words:
-            word = topic_words[0][0].strip().capitalize()
-            if word and word.isalpha() and len(word) >= 2:
-                candidates.append(word)
-
-    unique_candidates = list(dict.fromkeys(candidates))[:top_n]
-    print(f"\n✨ 발견된 새로운 측면 후보: {unique_candidates}")
-
-    return unique_candidates
-
-
-# ============================================================
-# 11. 감성 분석 (규칙 기반)
-# ============================================================
-
-def add_sentiment_labels_rule_based(df, positive_words, negative_words, negation_patterns):
-    """규칙 기반 감성 레이블링"""
-    print("\n😊 규칙 기반 감성 분석...")
-
-    df['sentiment'] = 1  # 기본: 중립
-
-    for idx, row in df.iterrows():
-        text = row['text']
-
-        has_negation = any(neg in text for neg in negation_patterns)
-        pos_count = sum(1 for w in positive_words if w in text)
-        neg_count = sum(1 for w in negative_words if w in text)
-
-        if has_negation:
-            if pos_count > neg_count:
-                df.at[idx, 'sentiment'] = 0
-            elif neg_count > pos_count:
-                df.at[idx, 'sentiment'] = 2
-        else:
-            if pos_count > neg_count:
-                df.at[idx, 'sentiment'] = 2
-            elif neg_count > pos_count:
-                df.at[idx, 'sentiment'] = 0
-
-    print(f"감성 분포: {df['sentiment'].value_counts().to_dict()}")
-    return df
+def _build_df_from_results(original_df, results):
+    """인덱스 기반으로 결과를 DataFrame으로 변환"""
+    rows = []
+    for r in results:
+        row = original_df.iloc[r['index']].to_dict()
+        row['aspect'] = r['aspect']
+        row['classification_method'] = r.get('method', 'unknown')
+        rows.append(row)
+    return pd.DataFrame(rows)

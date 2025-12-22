@@ -6,6 +6,7 @@ config.py
 import os
 import json
 from dotenv import load_dotenv
+from pathlib import Path
 
 # 환경 변수 로드
 load_dotenv()
@@ -20,8 +21,9 @@ class Config:
     # API Keys
     GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 
-    # Paths
-    JSONL_FOLDER_PATH = r"C:\Users\SS\PycharmProjects\Pipeline\cafe_reviews"
+    current_file = Path(__file__).resolve()
+    project_root = current_file.parent.parent
+    JSONL_FOLDER_PATH = project_root / "cafe_reviews"
 
     # Sampling & Translation
     SAMPLE_SIZE = 2000
