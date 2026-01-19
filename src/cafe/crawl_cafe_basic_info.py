@@ -23,6 +23,10 @@ def process_apollo_item(item_value, cafe_info_ref):
             cafe_info_ref['virtual_phone_number'] = item_value.get('virtualPhone')
             cafe_info_ref['payment_info'] = item_value.get('paymentInfo')
             cafe_info_ref['convenience'] = item_value.get('conveniences')
+            coordinate = item_value.get('coordinate')
+            if isinstance(coordinate, dict):
+                cafe_info_ref['lat'] = coordinate.get('x') # 경도
+                cafe_info_ref['lon'] = coordinate.get('y') # 위도
         case 'Query':
             for key, value in item_value.items():
                 if(key.startswith("placeDetail")):
@@ -94,6 +98,8 @@ def crawl_cafe_basic_info(business_id):
         "micro_review": None,
         "road_address": None,
         "address": None,
+        "lat": None,
+        "lon": None,
         "business_hours": [],
         "virtual_phone_number": None,
         "url": None,

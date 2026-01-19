@@ -77,14 +77,9 @@ poetry install --no-interaction
 echo "[ec2-user] Playwright 브라우저 바이너리 설치 (chromium)..."
 poetry run playwright install chromium
 
-echo "[ec2-user] 사용자 설정 완료."
+echo "[ec2-user] 사용자 설정 완료. tmux 세션에서 크롤러를 시작합니다."
+tmux new-session -d -s cafe "source /home/ec2-user/.bashrc && cd ${PROJECT_DIR} && poetry run python src/cafe/crawl.py"
+
 EOF
 
 echo "--- 모든 EC2 초기화 스크립트가 성공적으로 완료되었습니다 ---"
-
-# ssh -i "worker1.pem" ec2-user@13.209.19.228
-# ssh -i "worker1.pem" ec2-user@52.78.201.242
-# ssh -i "worker1.pem" ec2-user@13.209.70.140
-# ssh -i "worker1.pem" ec2-user@3.37.123.104
-# ssh -i "worker1.pem" ec2-user@52.78.153.244
-# poetry run python src/cafe/crawl.py
